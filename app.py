@@ -2,31 +2,32 @@ import modal
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
-# 1. Define the base model
-BASE_MODEL = "unsloth/llama-3-8b-Instruct"
+BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B"  # non-quantized, vLLM handles its own optimization
 
-# 2. Define the container environment
-vllm_image = (
-    modal.Image.debian_slim(python_version="3.10")
-    .pip_install("vllm==0.4.1", "huggingface_hub[cli]") # Ensure HF hub is installed
+base_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "vllm==0.6.3",
+        "fastapi[standard]",
+        "huggingface_hub",
+        "torch==2.4.0",
+        "transformers==4.44.2",  # pinned for tokenizer compatibility
+        "tokenizers==0.19.1",    # pinned for tokenizer compatibility
+    )
     .run_commands(
-        # Use the new 'hf' command or the modern 'huggingface-cli' flag
-        f"hf download {BASE_MODEL}" 
+        f"python3 -c \"from huggingface_hub import snapshot_download; snapshot_download('{BASE_MODEL}')\"",
+        secrets=[modal.Secret.from_name("huggingface-secret")]
     )
 )
 
-# --- THIS IS THE PART THAT WAS MISSING ---
 app = modal.App("pangasinan-agent-backend")
-# -----------------------------------------
 
-# 3. Define the Inference Engine
 @app.cls(
-    image=vllm_image,
+    image=base_image,
     gpu="A10G",
-    secrets=[modal.Secret.from_name("huggingface-secret")], 
-    # container_idle_timeout=300, <--- DELETE THIS
-    scaledown_window=300,        # <--- ADD THIS (renamed as of Feb 2025)
-)   
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    scaledown_window=300,
+)
 class VllmEngine:
     @modal.enter()
     def start_engine(self):
@@ -36,53 +37,42 @@ class VllmEngine:
         engine_args = AsyncEngineArgs(
             model=BASE_MODEL,
             gpu_memory_utilization=0.90,
-            enable_lora=True,          
-            max_loras=4,               
+            enable_lora=True,
+            max_loras=4,
             max_model_len=2048,
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     @modal.method()
-    async def generate(self, prompt: str, hf_repo_id: str):
+    async def generate(self, prompt: str, hf_repo_id: str) -> str:
         from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
         import uuid
 
         sampling_params = SamplingParams(temperature=0.7, max_tokens=512)
         request_id = str(uuid.uuid4())
-        
-        # Pulls the adapter directly from your private HF repo
         lora_request = LoRARequest(hf_repo_id, 1, hf_repo_id)
 
-        results_generator = self.engine.generate(
-            prompt, 
-            sampling_params, 
-            request_id, 
-            lora_request=lora_request
-        )
-
-        async for request_output in results_generator:
+        full_output = ""
+        async for request_output in self.engine.generate(
+            prompt, sampling_params, request_id, lora_request=lora_request
+        ):
             if request_output.outputs:
-                yield request_output.outputs[0].text
+                full_output = request_output.outputs[0].text
 
-# 4. The REST API Endpoint
+        return full_output
+
+@app.function(image=base_image)
 @modal.fastapi_endpoint(method="POST")
-async def chat_endpoint(request: Request):
+async def chat(request: Request):
     data = await request.json()
-    # ... your existing logic
     prompt = data.get("prompt", "")
-    hf_repo_id = data.get("hf_repo_id") # e.g. "Kiruu/pangasinan-v1"
+    hf_repo_id = data.get("hf_repo_id")
 
     if not hf_repo_id:
         return {"error": "Missing hf_repo_id"}
 
     engine = VllmEngine()
+    result = await engine.generate.remote.aio(prompt, hf_repo_id=hf_repo_id)
 
-    async def stream_response():
-        previous_text_len = 0
-        async for full_text in engine.generate.remote_gen(prompt, hf_repo_id=hf_repo_id):
-            new_text = full_text[previous_text_len:]
-            previous_text_len = len(full_text)
-            yield new_text
-
-    return StreamingResponse(stream_response(), media_type="text/plain")
+    return {"response": result}
