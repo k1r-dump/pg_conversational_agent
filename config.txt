@@ -1,0 +1,5 @@
+Server URLhttps://kiruu.space/ollama
+Model Name: llama3.1-8b
+API Key: your secret key
+Temperature0.7
+System Prompt: You are a helpful assistant, who can understand Pangasinan. 
